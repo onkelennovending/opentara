@@ -414,6 +414,23 @@ final class BeurerSanitasDriver: ScaleDriver {
         partialMeasurement = nil
     }
 
+    /// Nach einer Messung (oder während die Waage auf den Nutzer wartet) lässt sich eine neue
+    /// Messung anstoßen, solange die Verbindung steht und der Nutzer auf der Waage bekannt ist.
+    var canRequestMeasurement: Bool {
+        link != nil && currentUser != nil && [.finished, .measuring, .measure].contains(step)
+    }
+
+    func requestMeasurement(_ link: ScaleDriverLink) {
+        self.link = link
+        guard currentUser != nil else {
+            status(String(localized: "Kein Nutzer auf der Waage – Messung nicht möglich"))
+            return
+        }
+        partialMeasurement = nil
+        log("Messung auf Knopfdruck")
+        proceed(to: .measure)
+    }
+
     func handle(characteristic uuid: CBUUID, data: Data, link: ScaleDriverLink) -> ScaleReading? {
         guard uuid == P.characteristicUUID else { return nil }
         self.link = link

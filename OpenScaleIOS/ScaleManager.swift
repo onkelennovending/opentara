@@ -20,6 +20,14 @@ final class ScaleManager: NSObject, ObservableObject {
     @Published var lastDeviceName: String = ""
     @Published var log: [String] = []
 
+    /// Name der Waage, mit der gerade eine GATT-Verbindung steht (nil = keine).
+    @Published var connectedDeviceName: String?
+    /// Der verbundene Treiber kann gerade auf Knopfdruck eine Messung auslösen.
+    @Published var canTriggerMeasurement: Bool = false
+    /// Gemerkte Waage (nach der ersten erfolgreichen Verbindung). Beim nächsten Start wird sie
+    /// ohne Suche per wartender Verbindung angesprochen, sobald sie sendet.
+    @Published var rememberedDeviceName: String?
+
     /// Wird aufgerufen, sobald eine stabilisierte Messung eintrifft.
     var onStabilizedMeasurement: ((ScaleMeasurement) -> Void)?
 
@@ -36,9 +44,14 @@ final class ScaleManager: NSObject, ObservableObject {
     private var writeCharacteristic: CBCharacteristic?
     private var notifyingCount = 0
     private var driverReady = false
+    private var activeDeviceName: String?
+
+    private let rememberedIdKey = "openscale.scale.peripheralId.v1"
+    private let rememberedNameKey = "openscale.scale.peripheralName.v1"
 
     override init() {
         super.init()
+        rememberedDeviceName = UserDefaults.standard.string(forKey: rememberedNameKey)
         central = CBCentralManager(delegate: self, queue: nil)
     }
 
@@ -49,11 +62,66 @@ final class ScaleManager: NSObject, ObservableObject {
         }
         log.removeAll()
         isScanning = true
-        statusText = String(localized: "Suche Waage… jetzt barfuß draufstellen")
+        if let (peripheral, driver, name) = rememberedPeripheral() {
+            // Gekoppelt: wartende Verbindung, iOS verbindet, sobald die Waage sendet.
+            waitFor(peripheral, driver: driver, name: name)
+            statusText = String(localized: "Gekoppelt mit \(name) – wartet auf die Waage (zum Wecken drauftippen)")
+        } else {
+            statusText = String(localized: "Suche Waage… jetzt barfuß draufstellen")
+        }
+        // Die Suche läuft zusätzlich, damit eine neue/andere Waage gefunden wird.
         central.scanForPeripherals(
             withServices: nil,
             options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
         )
+    }
+
+    /// Löst beim verbundenen Treiber eine Messung aus (Knopf „Jetzt wiegen“).
+    func triggerMeasurement() {
+        guard driverReady, let driver = activeDriver else { return }
+        driver.requestMeasurement(makeLink())
+        refreshTriggerState()
+    }
+
+    /// Vergisst die gemerkte Waage; die nächste Suche läuft wieder offen.
+    func forgetDevice() {
+        UserDefaults.standard.removeObject(forKey: rememberedIdKey)
+        UserDefaults.standard.removeObject(forKey: rememberedNameKey)
+        rememberedDeviceName = nil
+        if isScanning { stopScan() }
+    }
+
+    private func rememberedPeripheral() -> (CBPeripheral, ScaleDriver, String)? {
+        let defaults = UserDefaults.standard
+        guard let idString = defaults.string(forKey: rememberedIdKey), let id = UUID(uuidString: idString),
+              let name = defaults.string(forKey: rememberedNameKey),
+              let peripheral = central.retrievePeripherals(withIdentifiers: [id]).first,
+              let driver = drivers.first(where: {
+                  $0.kind == .connection && $0.matches(name: name, serviceData: [:], advertised: [])
+              })
+        else { return nil }
+        return (peripheral, driver, name)
+    }
+
+    private func remember(_ peripheral: CBPeripheral, name: String) {
+        UserDefaults.standard.set(peripheral.identifier.uuidString, forKey: rememberedIdKey)
+        UserDefaults.standard.set(name, forKey: rememberedNameKey)
+        rememberedDeviceName = name
+    }
+
+    /// Wartende Verbindung zu einer bekannten Waage (ohne Suche; iOS verbindet beim nächsten Senden).
+    private func waitFor(_ peripheral: CBPeripheral, driver: ScaleDriver, name: String) {
+        activeDriver = driver
+        activePeripheral = peripheral
+        activeDeviceName = name
+        peripheral.delegate = self
+        central.connect(peripheral, options: nil)
+        appendLog("warte auf [\(driver.displayName)] \(name)")
+    }
+
+    private func refreshTriggerState() {
+        let can = driverReady && (activeDriver?.canRequestMeasurement ?? false)
+        DispatchQueue.main.async { self.canTriggerMeasurement = can }
     }
 
     func stopScan() {
@@ -68,9 +136,14 @@ final class ScaleManager: NSObject, ObservableObject {
     private func clearConnection() {
         activePeripheral = nil
         activeDriver = nil
+        activeDeviceName = nil
         writeCharacteristic = nil
         notifyingCount = 0
         driverReady = false
+        DispatchQueue.main.async {
+            self.connectedDeviceName = nil
+            self.canTriggerMeasurement = false
+        }
     }
 
     private func appendLog(_ line: String) {
@@ -145,7 +218,13 @@ final class ScaleManager: NSObject, ObservableObject {
         guard notifyingCount > 0 || profile.notifyUUIDs.isEmpty else { return }
         if profile.writeUUID != nil && writeCharacteristic == nil { return }
         driverReady = true
+        if let p = activePeripheral {
+            let name = activeDeviceName ?? p.name ?? driver.displayName
+            remember(p, name: name)
+            DispatchQueue.main.async { self.connectedDeviceName = name }
+        }
         driver.onReady(makeLink())
+        refreshTriggerState()
     }
 }
 
@@ -197,6 +276,7 @@ extension ScaleManager: CBCentralManagerDelegate {
             && driver.matches(name: name, serviceData: serviceData, advertised: advertised) {
             activeDriver = driver
             activePeripheral = peripheral
+            activeDeviceName = name
             peripheral.delegate = self
             central.connect(peripheral, options: nil)
             let label = name ?? peripheral.identifier.uuidString
@@ -224,10 +304,21 @@ extension ScaleManager: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager,
                         didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         if peripheral == activePeripheral {
-            activeDriver?.onDisconnected()
+            let driver = activeDriver
+            let name = activeDeviceName
+            driver?.onDisconnected()
             clearConnection()
             let reason = error.map { ": \($0.localizedDescription)" } ?? ""
             DispatchQueue.main.async { self.appendLog("getrennt\(reason)") }
+            // Sitzung läuft weiter: auf die nächste Weckung der Waage warten (Beurer schläft
+            // nach der Messung ein und sendet erst wieder, wenn man drauftippt).
+            if isScanning, let driver, driverReady == false {
+                let label = name ?? peripheral.name ?? driver.displayName
+                waitFor(peripheral, driver: driver, name: label)
+                DispatchQueue.main.async {
+                    self.statusText = String(localized: "\(label) schläft – zum Wiegen drauftippen, die Verbindung kommt von selbst")
+                }
+            }
         }
     }
 }
@@ -289,5 +380,6 @@ extension ScaleManager: CBPeripheralDelegate {
         if let reading = driver.handle(characteristic: characteristic.uuid, data: data, link: link) {
             DispatchQueue.main.async { self.handle(reading) }
         }
+        refreshTriggerState()
     }
 }
