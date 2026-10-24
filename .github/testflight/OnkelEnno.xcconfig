@@ -6,6 +6,13 @@ PRODUCT_BUNDLE_IDENTIFIER = com.onkelenno.opentara
 DEVELOPMENT_TEAM = 3P3KVS4BZK
 CODE_SIGN_STYLE = Automatic
 
+// Archive straight with the distribution identity. With the default (Apple Development)
+// xcodebuild archive asks the portal for a development profile, and that needs at least one
+// registered device ("Your team has no devices from which to generate a provisioning profile").
+// A distribution profile needs none; -allowProvisioningUpdates creates it with the
+// cloud-managed Apple Distribution certificate.
+CODE_SIGN_IDENTITY = Apple Distribution
+
 // The project's entitlements file only holds macOS App-Sandbox keys (the project is
 // multiplatform); an iOS App Store build needs none of them. OpenTara uses no HealthKit,
 // no push, no iCloud, so the App ID needs no capabilities either.
