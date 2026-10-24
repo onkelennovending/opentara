@@ -1,0 +1,133 @@
+# Fork-only: signed archive of OpenTara for the Onkel Enno team (3P3KVS4BZK) and upload to
+# TestFlight, authenticated with an App Store Connect API key. Runs on pushes to main and
+# on demand. Without the three secrets the signed job is skipped with a notice, so the fork
+# CI stays green and the unsigned .ipa from the "Build" workflow remains the fallback.
+# Setup steps for the human: TESTFLIGHT.md.
+name: TestFlight
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "source.json"
+      - ".github/ISSUE_TEMPLATE/**"
+  workflow_dispatch:
+
+concurrency:
+  group: testflight-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Check App Store Connect secrets
+    runs-on: ubuntu-latest
+    outputs:
+      configured: ${{ steps.check.outputs.configured }}
+    steps:
+      - id: check
+        env:
+          KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+        run: |
+          if [ -n "$KEY_ID" ] && [ -n "$ISSUER_ID" ] && [ -n "$PRIVATE_KEY" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+            echo "App Store Connect secrets present – the signed TestFlight job will run."
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=TestFlight upload skipped::Secrets ASC_KEY_ID, ASC_ISSUER_ID and ASC_PRIVATE_KEY are not all set (see TESTFLIGHT.md). The unsigned OpenTara-unsigned.ipa from the Build workflow remains available."
+            {
+              echo "### TestFlight upload skipped"
+              echo
+              echo "Set the repository secrets \`ASC_KEY_ID\`, \`ASC_ISSUER_ID\` and \`ASC_PRIVATE_KEY\` (see TESTFLIGHT.md)."
+              echo "Fallback: the unsigned \`OpenTara-unsigned.ipa\` artifact of the **Build** workflow (SideStore/AltStore)."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  testflight:
+    name: Signed archive → TestFlight
+    needs: preflight
+    if: needs.preflight.outputs.configured == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 60
+    env:
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: xcodebuild -version
+
+      - name: Install App Store Connect API key
+        id: key
+        env:
+          ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/private_keys"
+          KEY="$HOME/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+          if printf '%s' "$ASC_PRIVATE_KEY" | grep -q "BEGIN PRIVATE KEY"; then
+            printf '%s\n' "$ASC_PRIVATE_KEY" > "$KEY"
+          else
+            printf '%s' "$ASC_PRIVATE_KEY" | base64 --decode > "$KEY"
+          fi
+          chmod 600 "$KEY"
+          grep -q "BEGIN PRIVATE KEY" "$KEY" || { echo "::error::ASC_PRIVATE_KEY is neither the .p8 text nor its base64"; exit 1; }
+          echo "path=$KEY" >> "$GITHUB_OUTPUT"
+
+      - name: Archive with cloud-managed signing
+        run: |
+          set -o pipefail
+          xcodebuild archive \
+            -project OpenScaleIOS.xcodeproj \
+            -scheme OpenScaleIOS \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -archivePath build/OpenTara.xcarchive \
+            -xcconfig .github/testflight/OnkelEnno.xcconfig \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "${{ steps.key.outputs.path }}" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            CURRENT_PROJECT_VERSION=${{ github.run_number }} \
+            2>&1 | tee xcodebuild-archive.log
+
+      - name: Upload to App Store Connect (TestFlight)
+        run: |
+          set -o pipefail
+          xcodebuild -exportArchive \
+            -archivePath build/OpenTara.xcarchive \
+            -exportOptionsPlist .github/testflight/ExportOptions.plist \
+            -exportPath build/export \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "${{ steps.key.outputs.path }}" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            2>&1 | tee xcodebuild-export.log
+
+      - name: Summary
+        run: |
+          VERSION=$(plutil -extract CFBundleShortVersionString raw build/OpenTara.xcarchive/Products/Applications/OpenScaleIOS.app/Info.plist 2>/dev/null || echo "?")
+          {
+            echo "### Uploaded to TestFlight"
+            echo
+            echo "- Bundle id: \`com.onkelenno.opentara\`, team \`3P3KVS4BZK\`"
+            echo "- Version ${VERSION}, build ${{ github.run_number }}"
+            echo "- App Store Connect processes the build for a few minutes, then it appears under *TestFlight → iOS builds* and reaches the internal testers."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: testflight-logs
+          path: |
+            xcodebuild-archive.log
+            xcodebuild-export.log
+          if-no-files-found: ignore
+
+      - name: Remove API key
+        if: always()
+        run: rm -f "$HOME/private_keys/AuthKey_${ASC_KEY_ID}.p8"

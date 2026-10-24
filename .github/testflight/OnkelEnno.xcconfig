@@ -1,0 +1,16 @@
+// Fork-only build settings for signed TestFlight builds of the Onkel Enno team.
+// Passed to xcodebuild with -xcconfig by .github/workflows/testflight.yml; nothing here
+// touches the project file, so the upstream pull request keeps etlami's bundle id.
+
+PRODUCT_BUNDLE_IDENTIFIER = com.onkelenno.opentara
+DEVELOPMENT_TEAM = 3P3KVS4BZK
+CODE_SIGN_STYLE = Automatic
+
+// The project's entitlements file only holds macOS App-Sandbox keys (the project is
+// multiplatform); an iOS App Store build needs none of them. OpenTara uses no HealthKit,
+// no push, no iCloud, so the App ID needs no capabilities either.
+CODE_SIGN_ENTITLEMENTS =
+
+// No custom encryption → answer the export-compliance question at build time, otherwise
+// every TestFlight build waits for a manual answer in App Store Connect.
+INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO
