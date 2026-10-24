@@ -13,6 +13,8 @@ on:
       - "**.md"
       - "source.json"
       - ".github/ISSUE_TEMPLATE/**"
+      - ".github/testflight/*.py"
+      - ".github/testflight/*.sh"
   workflow_dispatch:
 
 concurrency:

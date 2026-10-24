@@ -4,10 +4,19 @@
     asc.py check              <KEY_ID> <ISSUER_ID> <AuthKey.p8>   key usable? bundle id registered? app record present?
     asc.py register-bundle-id <KEY_ID> <ISSUER_ID> <AuthKey.p8>   registers com.onkelenno.opentara (iOS) if missing
     asc.py builds             <KEY_ID> <ISSUER_ID> <AuthKey.p8>   latest builds of the app with processing state
+    asc.py issue-signing      <KEY_ID> <ISSUER_ID> <AuthKey.p8>   new iOS distribution certificate + App Store profile,
+                                                                   .p12 next to the .p8, and the three signing secrets
+                                                                   (ASC_DIST_P12, ASC_DIST_P12_PASSWORD,
+                                                                   ASC_PROVISIONING_PROFILE) in the fork
 
-Needs python3-jwt and python3-cryptography (ES256) plus requests. The .p8 never leaves the box.
+Needs python3-jwt and python3-cryptography (ES256), requests, openssl and gh. The .p8 and the
+certificate's private key never leave the box; the GitHub secrets hold copies for the runner.
 """
+import base64
 import json
+import os
+import secrets as pysecrets
+import subprocess
 import sys
 import time
 
@@ -16,6 +25,9 @@ import requests
 
 BUNDLE_ID = "com.onkelenno.opentara"
 API = "https://api.appstoreconnect.apple.com/v1"
+TEAM_NAME = "Onkel Enno Verkaufsautomaten GmbH"
+PROFILE_NAME = "OpenTara Enno AppStore CI"
+REPO = os.environ.get("OPENTARA_REPO", "onkelennovending/opentara")
 
 
 def token(key_id: str, issuer_id: str, p8_path: str) -> str:
@@ -99,11 +111,65 @@ def cmd_builds(tok):
     return 0
 
 
+def cmd_issue_signing(tok, p8_path):
+    """Certificate + profile through the API, .p12 with openssl, secrets with gh."""
+    out_dir = os.path.dirname(os.path.abspath(p8_path))
+    os.umask(0o077)
+    key_path = os.path.join(out_dir, "dist.key")
+    csr_path = os.path.join(out_dir, "dist.csr")
+    subprocess.run(["openssl", "req", "-new", "-newkey", "rsa:2048", "-nodes", "-keyout", key_path, "-out", csr_path,
+                    "-subj", f"/CN=OpenTara CI Distribution/O={TEAM_NAME}/C=DE"], check=True, capture_output=True)
+    with open(csr_path, encoding="utf-8") as fh:
+        csr = fh.read()
+    cert = call(tok, "POST", "/certificates", json={"data": {"type": "certificates", "attributes": {
+        "certificateType": "IOS_DISTRIBUTION", "csrContent": csr}}})["data"]
+    print(f"certificate {cert['id']}: {cert['attributes']['name']}, expires {cert['attributes']['expirationDate']}")
+    pem_path = os.path.join(out_dir, "dist.pem")
+    der = base64.b64decode(cert["attributes"]["certificateContent"])
+    subprocess.run(["openssl", "x509", "-inform", "DER", "-out", pem_path], input=der, check=True, capture_output=True)
+
+    bundle = find_bundle_id(tok) or sys.exit(f"{BUNDLE_ID} is not registered; run register-bundle-id first")
+    profile = call(tok, "POST", "/profiles", json={"data": {"type": "profiles",
+        "attributes": {"name": PROFILE_NAME, "profileType": "IOS_APP_STORE"},
+        "relationships": {"bundleId": {"data": {"type": "bundleIds", "id": bundle["id"]}},
+                          "certificates": {"data": [{"type": "certificates", "id": cert["id"]}]}}}})["data"]
+    print(f"profile {profile['id']}: {profile['attributes']['name']} ({profile['attributes']['uuid']}), "
+          f"expires {profile['attributes']['expirationDate']}")
+    profile_path = os.path.join(out_dir, "opentara.mobileprovision")
+    with open(profile_path, "wb") as fh:
+        fh.write(base64.b64decode(profile["attributes"]["profileContent"]))
+
+    password = pysecrets.token_hex(16)
+    p12_path = os.path.join(out_dir, "dist.p12")
+    base = ["openssl", "pkcs12", "-export", "-inkey", key_path, "-in", pem_path, "-name", cert["attributes"]["name"],
+            "-out", p12_path, "-passout", f"pass:{password}"]
+    # -legacy (RC2/3DES) keeps macOS `security import` happy; fall back to the OpenSSL 3 default.
+    if subprocess.run(base + ["-legacy"], capture_output=True).returncode != 0:
+        subprocess.run(base, check=True, capture_output=True)
+    with open(os.path.join(out_dir, "dist.p12.password"), "w", encoding="utf-8") as fh:
+        fh.write(password)
+
+    def set_secret(name, value):
+        subprocess.run(["gh", "secret", "set", name, "--repo", REPO, "--body", value], check=True)
+        print(f"secret {name} set in {REPO}")
+    with open(p12_path, "rb") as fh:
+        set_secret("ASC_DIST_P12", base64.b64encode(fh.read()).decode())
+    set_secret("ASC_DIST_P12_PASSWORD", password)
+    with open(profile_path, "rb") as fh:
+        set_secret("ASC_PROVISIONING_PROFILE", base64.b64encode(fh.read()).decode())
+    print("done – the next TestFlight run uses the new certificate and profile; "
+          "revoke the old certificate in the portal once that run is green")
+    return 0
+
+
 def main(argv):
-    if len(argv) != 5 or argv[1] not in ("check", "register-bundle-id", "builds"):
+    commands = {"check": cmd_check, "register-bundle-id": cmd_register, "builds": cmd_builds}
+    if len(argv) != 5 or argv[1] not in (*commands, "issue-signing"):
         sys.exit(__doc__)
     tok = token(argv[2], argv[3], argv[4])
-    return {"check": cmd_check, "register-bundle-id": cmd_register, "builds": cmd_builds}[argv[1]](tok)
+    if argv[1] == "issue-signing":
+        return cmd_issue_signing(tok, argv[4])
+    return commands[argv[1]](tok)
 
 
 if __name__ == "__main__":

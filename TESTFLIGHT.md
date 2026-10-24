@@ -6,17 +6,44 @@ ausschließlich im GitHub-Actions-macOS-Runner:
 | Weg | Workflow | Signatur | Bundle-ID | Installation |
 |-----|----------|----------|-----------|--------------|
 | Fallback | **Build** (`.github/workflows/build-ipa.yml`), jeder Push | unsigniert | `kloster.OpenScaleIOS` (upstream) | Artefakt `OpenTara-unsigned.ipa` herunterladen, mit SideStore/AltStore und eigener Apple-ID signieren |
-| TestFlight | **TestFlight** (`.github/workflows/testflight.yml`), Push auf `main` oder *Run workflow* | Apple Distribution, cloud-managed, Team `3P3KVS4BZK` (Onkel Enno Verkaufsautomaten GmbH) | `com.onkelenno.opentara` | TestFlight-App auf dem iPhone, interne Tester |
+| TestFlight | **TestFlight** (`.github/workflows/testflight.yml`), Push auf `main` oder *Run workflow* | iPhone Distribution, eigenes Zertifikat + App-Store-Profil (manuell), Team `3P3KVS4BZK` (Onkel Enno Verkaufsautomaten GmbH) | `com.onkelenno.opentara` | TestFlight-App auf dem iPhone, interne Tester |
 
 Der TestFlight-Weg liegt komplett in `.github/testflight/` und `.github/workflows/testflight.yml`;
 die Projektdatei bleibt unverändert, damit der Upstream-Pull-Request nichts davon enthält.
-Ohne die drei Secrets überspringt der Workflow den signierten Job sichtbar (Notice im Lauf)
-und bleibt grün. Der Fork muss **öffentlich** bleiben, sonst kosten die macOS-Minuten Geld.
+Ohne die sechs Secrets überspringt der Workflow den signierten Job sichtbar (Notice im Lauf,
+nennt die fehlenden) und bleibt grün. Der Fork muss **öffentlich** bleiben, sonst kosten die macOS-Minuten Geld.
 
 Weil die Bundle-IDs verschieden sind, sind SideStore- und TestFlight-Installation zwei
 getrennte Apps mit getrennten Daten (CSV-Export/Import in der App überträgt die Historie).
 
-## Einmalig von Hand (Browser und iPhone)
+## Stand 24.10.2026
+
+Eingerichtet (per Claude in Chrome bzw. App-Store-Connect-API, Schlüsselmaterial liegt auf
+openclaude1 in `/home/claude/ai/opentara-secrets/`, nur für den Nutzer `claude` lesbar):
+
+| Was | Wert |
+|-----|------|
+| API-Key | `GitHub Actions OpenTara`, Key-ID `6CH4M49C77`, Rolle App-Manager, Issuer `33d1053e-0414-47ea-90a8-460e8d202438` |
+| Bundle-ID | `com.onkelenno.opentara` (Portal-ID `4STA2ZF2P5`, keine Capabilities) |
+| App-Eintrag | `OpenTara Enno`, App-ID `6826643751`, SKU `opentara`, Primärsprache Deutsch |
+| Zertifikat | `iPhone Distribution: Onkel Enno Verkaufsautomaten GmbH`, Portal-ID `67RYZ62L4X`, gültig bis 24.10.2027 |
+| Profil | `OpenTara Enno AppStore CI` (IOS_APP_STORE, Portal-ID `96TH575879`), gültig bis 24.10.2027 |
+| Interne Testgruppe | `Onkel Enno` (alle Builds automatisch), Tester `info@onkel-enno-verkaufsautomaten.de` |
+
+Secrets im Fork: `ASC_KEY_ID`, `ASC_ISSUER_ID`, `ASC_PRIVATE_KEY` (API-Key) sowie
+`ASC_DIST_P12`, `ASC_DIST_P12_PASSWORD`, `ASC_PROVISIONING_PROFILE` (Signatur, base64).
+
+**Warum manuell signiert wird:** `xcodebuild archive` mit automatischem Signieren verlangt auf
+dem Runner ein *Development*-Profil, und das gibt es nur mit mindestens einem registrierten
+Gerät im Team („Your team has no devices from which to generate a provisioning profile“). Ein
+App-Store-Profil braucht kein Gerät. Deshalb erzeugt `asc.py` Zertifikat und Profil über die
+API, und der Workflow importiert beides in einen temporären Schlüsselbund.
+
+**Verlängern (vor dem 24.10.2027 oder nach Widerruf):** auf openclaude1
+`python3 -I .github/testflight/asc.py issue-signing 6CH4M49C77 <ISSUER_ID> <AuthKey.p8>` –
+erzeugt neues Zertifikat, neues Profil, neue `.p12` und setzt die drei Signatur-Secrets.
+
+## Einmalig von Hand (Browser und iPhone) – bereits erledigt, zur Nachvollziehbarkeit
 
 1. **Bundle-ID registrieren** – [developer.apple.com → Identifiers](https://developer.apple.com/account/resources/identifiers/list)
    → **+** → *App IDs* → *App* → Description `OpenTara`, Bundle ID *Explicit*
@@ -38,6 +65,9 @@ getrennte Apps mit getrennten Daten (CSV-Export/Import in der App überträgt di
    - `ASC_ISSUER_ID` – die Issuer ID (UUID)
    - `ASC_PRIVATE_KEY` – der komplette Inhalt der `.p8` inklusive der Zeilen
      `-----BEGIN PRIVATE KEY-----` / `-----END PRIVATE KEY-----` (alternativ base64-kodiert)
+   - `ASC_DIST_P12`, `ASC_DIST_P12_PASSWORD`, `ASC_PROVISIONING_PROFILE` – legt
+     `asc.py issue-signing` an (Distribution-Zertifikat als `.p12`, Passwort, App-Store-Profil).
+     Von Hand: `set-secrets.sh` für die ersten drei, dann `asc.py issue-signing`.
 5. **Workflow starten** – [Actions → TestFlight](https://github.com/onkelennovending/opentara/actions/workflows/testflight.yml)
    → *Run workflow* auf `main` (oder einfach auf `main` pushen). Der erste Lauf legt das
    cloud-verwaltete Distribution-Zertifikat und das Provisioning-Profil selbst an. Die
@@ -51,23 +81,28 @@ getrennte Apps mit getrennten Daten (CSV-Export/Import in der App überträgt di
 
 ## Was der Workflow tut
 
+- Temporärer Schlüsselbund: Apple-WWDR-G3-Zwischenzertifikat, die `.p12` aus `ASC_DIST_P12`
+  und das Profil aus `ASC_PROVISIONING_PROFILE` (nach `~/Library/MobileDevice/Provisioning Profiles/`).
 - `xcodebuild archive` mit `-xcconfig .github/testflight/OnkelEnno.xcconfig`
-  (Bundle-ID, Team, automatisches Signieren, `ITSAppUsesNonExemptEncryption = NO`),
-  `-allowProvisioningUpdates` und dem API-Key (`-authenticationKeyPath/-KeyID/-KeyIssuerID`),
-  `CURRENT_PROJECT_VERSION` = Run-Nummer.
-- `xcodebuild -exportArchive` mit `.github/testflight/ExportOptions.plist`
-  (`method: app-store-connect`, `destination: upload`): Export und Upload in einem Schritt,
-  kein `altool` nötig.
-- Die `.p8` wird nach `~/private_keys/AuthKey_<KEY_ID>.p8` geschrieben und am Ende gelöscht.
-  Logs liegen als Artefakt `testflight-logs` am Lauf.
+  (Bundle-ID, Team, `CODE_SIGN_STYLE = Manual`, `CODE_SIGN_IDENTITY = iPhone Distribution`,
+  `ITSAppUsesNonExemptEncryption = NO`), `PROVISIONING_PROFILE_SPECIFIER` = Name aus dem Profil,
+  `CURRENT_PROJECT_VERSION` = Run-Nummer. Achtung: Werte aus `-xcconfig` schlagen Kommandozeilen-
+  Argumente, deshalb stehen Profilname und Build-Nummer nicht in der Datei.
+- `xcodebuild -exportArchive` mit einer im Lauf erzeugten `ExportOptions.plist`
+  (`method: app-store-connect`, `destination: upload`, `signingStyle: manual`) und dem API-Key
+  (`-authenticationKeyPath/-KeyID/-KeyIssuerID`): Export und Upload in einem Schritt, kein `altool`.
+- `.p8`, Schlüsselbund und Profil werden am Ende gelöscht. Logs liegen als Artefakt
+  `testflight-logs` am Lauf.
 
 ## Wenn etwas hakt
 
 | Meldung im Log | Ursache |
 |----------------|---------|
-| `No profiles for 'com.onkelenno.opentara' were found` / `Provisioning profile … doesn't include` | Bundle-ID nicht registriert (Schritt 1) oder Key-Rolle reicht nicht für Cloud-Signing (Schritt 3) |
+| `No profiles for 'com.onkelenno.opentara' were found` / `Your team has no devices` | Automatisches Signieren aktiv (xcconfig verändert?) – der Workflow signiert manuell, siehe oben |
+| `No signing certificate "iOS Distribution" found` / `0 valid identities found` | `.p12` oder Passwort passen nicht, oder das Zertifikat wurde widerrufen → `asc.py issue-signing` |
+| `Provisioning profile … doesn't include signing certificate` | Profil gehört zu einem anderen Zertifikat → `asc.py issue-signing` erzeugt beides zusammen neu |
 | `No suitable application records were found` / `bundle identifier … is not available` | App-Eintrag fehlt oder hat eine andere Bundle-ID (Schritt 2) |
 | `Authentication credentials are missing or invalid` | Key ID, Issuer ID und `.p8` passen nicht zusammen, oder die `.p8` ist unvollständig kopiert |
 | `The bundle version must be higher than the previously uploaded version` | Nur bei manuell hochgeladenen Builds möglich; dann `workflow_dispatch` erneut starten, die Run-Nummer steigt |
 | `Missing Compliance` in App Store Connect | Darf nicht mehr vorkommen (`ITSAppUsesNonExemptEncryption = NO` in der xcconfig); sonst einmal im Browser „Nein“ beantworten |
-| Job *Signed archive → TestFlight* ist `skipped` | Mindestens eines der drei Secrets fehlt oder ist leer (Schritt 4) |
+| Job *Signed archive → TestFlight* ist `skipped` | Mindestens eines der sechs Secrets fehlt oder ist leer; die Notice im Lauf nennt welche (Schritt 4) |
