@@ -312,6 +312,31 @@ struct BeurerSanitasDriverFlowTests {
         #expect(rec.statuses.last == String(localized: "Messung abgeschlossen"))
     }
 
+    @Test func measurementCanBeTriggeredAgainAfterFinish() {
+        let (driver, rec, link) = readyDriver(name: "BF700", user: fabian())
+        #expect(driver.canRequestMeasurement == false)
+        _ = feed(driver, link, [0xE6, 0x00, 0x20])
+        _ = feed(driver, link, [0xE7, 0xF0, 0x4F, 0x00, 0x5A, 0x28, 0xDC, 0x01, 0x00, 0x00, 0x00, 0x03])
+        _ = feed(driver, link, [0xE7, 0xF0, 0x33, 0x00, 0x01, 0x08])
+        _ = feed(driver, link, [0xE7, 0x34, 0x01, 0x01] + uid101 + [0x46, 0x41, 0x42, 0x55])
+        _ = feed(driver, link, [0xE7, 0xF0, 0x36, 0x00, 0x46, 0x41, 0x42, 0x55, 0x02, 0x07, 0xB4, 0x83])
+        _ = feed(driver, link, [0xE7, 0xF0, 0x40, 0x00])
+        _ = feed(driver, link, [0xE7, 0x59, 0x03, 0x01, 0x01] + uid101)
+        _ = feed(driver, link, [0xE7, 0x59, 0x03, 0x02] + Array(measurementBytes[0..<11]))
+        _ = feed(driver, link, [0xE7, 0x59, 0x03, 0x03] + Array(measurementBytes[11..<22]))
+        #expect(driver.step == .finished)
+        #expect(driver.canRequestMeasurement == true)
+
+        let before = rec.sent.count
+        driver.requestMeasurement(link)
+        #expect(rec.sent.count == before + 1)
+        #expect(rec.sent.last == [0xE7, 0x40] + uid101)
+        #expect(driver.step == .measure)
+
+        driver.onDisconnected()
+        #expect(driver.canRequestMeasurement == false)
+    }
+
     @Test func createsUserWhenScaleHasNone() {
         let (driver, rec, link) = readyDriver(name: "Beurer BF800", user: fabian())
         #expect(driver.startByte == 0xF7)

@@ -109,6 +109,13 @@ protocol ScaleDriver {
 
     /// Nur `.connection`: Verbindung beendet oder abgebrochen – Zustand verwerfen.
     func onDisconnected()
+
+    /// Nur `.connection`: kann der Treiber gerade auf Knopfdruck eine Messung auslösen
+    /// (z. B. Beurer `<sb> 40 <uid>` nach einer abgeschlossenen Messung)?
+    var canRequestMeasurement: Bool { get }
+
+    /// Nur `.connection`: Messung auslösen. Nur sinnvoll, wenn `canRequestMeasurement` wahr ist.
+    func requestMeasurement(_ link: ScaleDriverLink)
 }
 
 // Standard-Implementierungen, damit jeder Treiber nur das Nötige umsetzt.
@@ -121,6 +128,8 @@ extension ScaleDriver {
         handle(characteristic: uuid, data: data)
     }
     func onDisconnected() {}
+    var canRequestMeasurement: Bool { false }
+    func requestMeasurement(_ link: ScaleDriverLink) {}
 }
 
 /// Registry aller bekannten Treiber. Hier neue Waagen eintragen.

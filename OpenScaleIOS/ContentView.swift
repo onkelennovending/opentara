@@ -149,23 +149,58 @@ struct ContentView: View {
                 .foregroundStyle(.secondary)
             }
 
-            Button {
-                if scale.isScanning {
-                    scale.stopScan()
-                } else {
-                    // Waagen mit eigener Nutzerverwaltung (Beurer/Sanitas) brauchen das Profil.
-                    scale.userContext = store.activeProfile.map {
-                        ScaleUserContext(profile: $0, unit: store.weightUnit)
-                    }
-                    scale.startScan()
-                }
-            } label: {
-                Label(scale.isScanning ? "Suche läuft – stoppen" : "Waage suchen",
-                      systemImage: scale.isScanning ? "stop.circle" : "magnifyingglass")
-                    .frame(maxWidth: .infinity)
+            if let name = scale.connectedDeviceName {
+                Label(String(localized: "Verbunden: \(name)"), systemImage: "antenna.radiowaves.left.and.right")
+                    .font(.caption).foregroundStyle(.green)
+            } else if scale.isScanning, let name = scale.rememberedDeviceName {
+                Label(String(localized: "Gekoppelt: \(name)"), systemImage: "link")
+                    .font(.caption).foregroundStyle(.secondary)
             }
-            .buttonStyle(.borderedProminent)
-            .disabled(!scale.bluetoothReady)
+
+            if scale.connectedDeviceName != nil, scale.canTriggerMeasurement {
+                Button {
+                    scale.triggerMeasurement()
+                } label: {
+                    Label("Jetzt wiegen", systemImage: "scalemass")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+
+                Button {
+                    scale.stopScan()
+                } label: {
+                    Label("Verbindung trennen", systemImage: "stop.circle")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+            } else {
+                Button {
+                    if scale.isScanning {
+                        scale.stopScan()
+                    } else {
+                        // Waagen mit eigener Nutzerverwaltung (Beurer/Sanitas) brauchen das Profil.
+                        scale.userContext = store.activeProfile.map {
+                            ScaleUserContext(profile: $0, unit: store.weightUnit)
+                        }
+                        scale.startScan()
+                    }
+                } label: {
+                    Label(scanButtonTitle, systemImage: scale.isScanning ? "stop.circle" : "magnifyingglass")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!scale.bluetoothReady)
+            }
+
+            if scale.rememberedDeviceName != nil, !scale.isScanning {
+                Button {
+                    scale.forgetDevice()
+                } label: {
+                    Text("Gemerkte Waage vergessen").font(.caption)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+            }
 
             if let info = assignedInfo {
                 Text("→ zugeordnet: \(info)")
@@ -173,6 +208,18 @@ struct ContentView: View {
             }
         }
         .card()
+    }
+
+    private var scanButtonTitle: String {
+        if scale.isScanning {
+            return scale.connectedDeviceName != nil
+                ? String(localized: "Verbindung trennen")
+                : String(localized: "Warten beenden")
+        }
+        if let name = scale.rememberedDeviceName {
+            return String(localized: "Mit \(name) verbinden")
+        }
+        return String(localized: "Waage suchen")
     }
 
     // MARK: - Körperwerte
