@@ -79,6 +79,25 @@ erzeugt neues Zertifikat, neues Profil, neue `.p12` und setzt die drei Signatur-
 7. **iPhone** – App *TestFlight* aus dem App Store installieren, Einladung annehmen, OpenTara
    installieren. Builds laufen nach **90 Tagen** ab; ein neuer Workflow-Lauf verlängert.
 
+## Automatische Verlängerung alle ~80 Tage
+
+TestFlight-Builds laufen 90 Tage nach dem Upload ab. Der Workflow läuft deshalb zusätzlich
+**jeden Montag 05:17 UTC** per Zeitplan; der Vorab-Job fragt über die API den neuesten gültigen
+Build ab und lädt nur dann neu hoch, wenn er **80 Tage oder älter** ist (sonst „TestFlight up to
+date“ als Notice, Job übersprungen). Jeder Push auf `main` und *Run workflow* laden weiterhin
+immer hoch; mit dem Häkchen *only_if_due* verhält sich ein manueller Lauf wie der Zeitplan.
+
+Drei Dinge dazu:
+
+- **GitHub schaltet Zeitpläne nach 60 Tagen ohne Push ab.** Deshalb committet der Workflow nach
+  jedem Upload die Marker-Datei `.github/testflight/last-upload.txt` (`[skip ci]`, löst nichts
+  aus). Sollte der Zeitplan trotzdem abgeschaltet sein, steht im Actions-Tab ein gelbes Banner
+  „This scheduled workflow is disabled“ mit *Enable*.
+- Auf dem iPhone aktualisiert die TestFlight-App den Build selbst, wenn dort *Automatische
+  Updates* für OpenTara Enno an ist (Standard).
+- Zertifikat und Profil laufen am **24.10.2027** ab. Der Vorab-Job warnt ab 30 Tagen vorher
+  (`::warning`); dann einmal `asc.py issue-signing` ausführen (unten), fertig.
+
 ## Was der Workflow tut
 
 - Temporärer Schlüsselbund: Apple-WWDR-G3-Zwischenzertifikat, die `.p12` aus `ASC_DIST_P12`

@@ -1,7 +1,9 @@
 # Fork-only: signed archive of OpenTara for the Onkel Enno team (3P3KVS4BZK) and upload to
 # TestFlight. Signing is manual with the team's distribution certificate and an App Store
 # profile (both created via the App Store Connect API, see TESTFLIGHT.md); the upload
-# authenticates with an App Store Connect API key. Runs on pushes to main and on demand.
+# authenticates with an App Store Connect API key. Runs on pushes to main, on demand, and
+# weekly on a schedule: the scheduled run uploads only when the newest valid TestFlight build
+# is 80+ days old (builds expire after 90), so testers always have a working build.
 # Without the secrets the signed job is skipped with a notice, so the fork CI stays green and
 # the unsigned .ipa from the "Build" workflow remains the fallback.
 name: TestFlight
@@ -15,7 +17,17 @@ on:
       - ".github/ISSUE_TEMPLATE/**"
       - ".github/testflight/*.py"
       - ".github/testflight/*.sh"
+      - ".github/testflight/last-upload.txt"
+  schedule:
+    # Mondays 05:17 UTC. GitHub disables schedules after 60 days without a push; the
+    # marker commit after each upload keeps the repository active.
+    - cron: "17 5 * * 1"
   workflow_dispatch:
+    inputs:
+      only_if_due:
+        description: "Upload only when the newest valid build is 80+ days old (what the weekly schedule does)"
+        type: boolean
+        default: false
 
 concurrency:
   group: testflight-${{ github.ref }}
@@ -27,7 +39,10 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       configured: ${{ steps.check.outputs.configured }}
+      upload: ${{ steps.due.outputs.upload || 'true' }}
     steps:
+      - uses: actions/checkout@v4
+
       - id: check
         env:
           KEY_ID: ${{ secrets.ASC_KEY_ID }}
@@ -58,12 +73,37 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
+      - name: Is a fresh build due? (schedule, or manual run with only_if_due)
+        id: due
+        if: steps.check.outputs.configured == 'true' && (github.event_name == 'schedule' || inputs.only_if_due == true)
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          python3 -m pip install -q pyjwt cryptography requests
+          KEY="$RUNNER_TEMP/AuthKey_${ASC_KEY_ID}.p8"
+          if printf '%s' "$ASC_PRIVATE_KEY" | grep -q "BEGIN PRIVATE KEY"; then
+            printf '%s\n' "$ASC_PRIVATE_KEY" > "$KEY"
+          else
+            printf '%s' "$ASC_PRIVATE_KEY" | base64 --decode > "$KEY"
+          fi
+          python3 .github/testflight/asc.py due "$ASC_KEY_ID" "$ASC_ISSUER_ID" "$KEY" | tee due.txt
+          rm -f "$KEY"
+          if grep -q "nothing to do" due.txt; then
+            echo "::notice title=TestFlight up to date::$(grep 'newest valid build' due.txt)"
+            { echo "### TestFlight up to date"; echo; grep 'newest valid build' due.txt; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   testflight:
     name: Signed archive → TestFlight
     needs: preflight
-    if: needs.preflight.outputs.configured == 'true'
+    if: needs.preflight.outputs.configured == 'true' && needs.preflight.outputs.upload == 'true'
     runs-on: macos-latest
     timeout-minutes: 60
+    permissions:
+      contents: write
     env:
       ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
       ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
@@ -188,6 +228,17 @@ jobs:
             echo "- Version ${VERSION}, build ${{ github.run_number }}"
             echo "- App Store Connect processes the build for a few minutes, then it appears under *TestFlight → iOS builds* and reaches the internal testers."
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record the upload (marker commit keeps the weekly schedule alive)
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          printf 'build %s uploaded %s from %s (%s)\n' "${{ github.run_number }}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${{ github.sha }}" "${{ github.event_name }}" > .github/testflight/last-upload.txt
+          git add .github/testflight/last-upload.txt
+          git commit -m "TestFlight: build ${{ github.run_number }} uploaded [skip ci]" || exit 0
+          git pull --rebase origin main
+          git push origin HEAD:main
 
       - name: Upload logs
         if: always()

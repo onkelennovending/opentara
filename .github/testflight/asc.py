@@ -4,6 +4,10 @@
     asc.py check              <KEY_ID> <ISSUER_ID> <AuthKey.p8>   key usable? bundle id registered? app record present?
     asc.py register-bundle-id <KEY_ID> <ISSUER_ID> <AuthKey.p8>   registers com.onkelenno.opentara (iOS) if missing
     asc.py builds             <KEY_ID> <ISSUER_ID> <AuthKey.p8>   latest builds of the app with processing state
+    asc.py due                <KEY_ID> <ISSUER_ID> <AuthKey.p8>   is a fresh TestFlight build due? (newest valid build
+                                                                   older than MAX_BUILD_AGE_DAYS, or none); writes
+                                                                   upload=true|false to $GITHUB_OUTPUT when set, warns
+                                                                   when certificate or profile expire within 30 days
     asc.py issue-signing      <KEY_ID> <ISSUER_ID> <AuthKey.p8>   new iOS distribution certificate + App Store profile,
                                                                    .p12 next to the .p8, and the three signing secrets
                                                                    (ASC_DIST_P12, ASC_DIST_P12_PASSWORD,
@@ -15,6 +19,7 @@ certificate's private key never leave the box; the GitHub secrets hold copies fo
 import base64
 import json
 import os
+from datetime import datetime, timezone
 import secrets as pysecrets
 import subprocess
 import sys
@@ -28,6 +33,8 @@ API = "https://api.appstoreconnect.apple.com/v1"
 TEAM_NAME = "Onkel Enno Verkaufsautomaten GmbH"
 PROFILE_NAME = "OpenTara Enno AppStore CI"
 REPO = os.environ.get("OPENTARA_REPO", "onkelennovending/opentara")
+# TestFlight builds expire 90 days after upload; renew once the newest valid build is this old.
+MAX_BUILD_AGE_DAYS = int(os.environ.get("MAX_BUILD_AGE_DAYS", "80"))
 
 
 def token(key_id: str, issuer_id: str, p8_path: str) -> str:
@@ -111,6 +118,47 @@ def cmd_builds(tok):
     return 0
 
 
+def _days_until(iso):
+    return (datetime.fromisoformat(iso.replace("Z", "+00:00")) - datetime.now(timezone.utc)).days
+
+
+def cmd_due(tok):
+    app = find_app(tok) or sys.exit(f"no app record for {BUNDLE_ID}")
+    builds = call(tok, "GET", "/builds", params={
+        "filter[app]": app["id"], "sort": "-uploadedDate", "limit": 10,
+        "fields[builds]": "version,processingState,uploadedDate,expired"}).get("data", [])
+    newest = next((b for b in builds if b["attributes"]["processingState"] == "VALID" and not b["attributes"]["expired"]), None)
+    if newest:
+        age = -_days_until(newest["attributes"]["uploadedDate"])
+        due = age >= MAX_BUILD_AGE_DAYS
+        print(f"newest valid build {newest['attributes']['version']} is {age} day(s) old "
+              f"(limit {MAX_BUILD_AGE_DAYS}) -> {'upload' if due else 'nothing to do'}")
+    else:
+        due = True
+        print("no valid, unexpired build -> upload")
+
+    warnings = []
+    for prof in call(tok, "GET", "/profiles", params={"filter[name]": PROFILE_NAME,
+                                                       "fields[profiles]": "name,expirationDate,profileState"}).get("data", []):
+        left = _days_until(prof["attributes"]["expirationDate"])
+        print(f"profile '{prof['attributes']['name']}': {prof['attributes']['profileState']}, {left} day(s) left")
+        if left < 30:
+            warnings.append(f"profile '{prof['attributes']['name']}' expires in {left} days")
+    for cert in call(tok, "GET", "/certificates", params={"filter[certificateType]": "IOS_DISTRIBUTION",
+                                                           "fields[certificates]": "name,expirationDate"}).get("data", []):
+        left = _days_until(cert["attributes"]["expirationDate"])
+        print(f"certificate {cert['id']} '{cert['attributes']['name']}': {left} day(s) left")
+        if left < 30:
+            warnings.append(f"certificate {cert['id']} expires in {left} days")
+    for w in warnings:
+        print(f"::warning title=Signing material expires::{w} – run asc.py issue-signing (see TESTFLIGHT.md)")
+
+    if os.environ.get("GITHUB_OUTPUT"):
+        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+            fh.write(f"upload={'true' if due else 'false'}\n")
+    return 0
+
+
 def cmd_issue_signing(tok, p8_path):
     """Certificate + profile through the API, .p12 with openssl, secrets with gh."""
     out_dir = os.path.dirname(os.path.abspath(p8_path))
@@ -163,7 +211,7 @@ def cmd_issue_signing(tok, p8_path):
 
 
 def main(argv):
-    commands = {"check": cmd_check, "register-bundle-id": cmd_register, "builds": cmd_builds}
+    commands = {"check": cmd_check, "register-bundle-id": cmd_register, "builds": cmd_builds, "due": cmd_due}
     if len(argv) != 5 or argv[1] not in (*commands, "issue-signing"):
         sys.exit(__doc__)
     tok = token(argv[2], argv[3], argv[4])
