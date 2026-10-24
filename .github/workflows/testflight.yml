@@ -1,8 +1,9 @@
 # Fork-only: signed archive of OpenTara for the Onkel Enno team (3P3KVS4BZK) and upload to
-# TestFlight, authenticated with an App Store Connect API key. Runs on pushes to main and
-# on demand. Without the three secrets the signed job is skipped with a notice, so the fork
-# CI stays green and the unsigned .ipa from the "Build" workflow remains the fallback.
-# Setup steps for the human: TESTFLIGHT.md.
+# TestFlight. Signing is manual with the team's distribution certificate and an App Store
+# profile (both created via the App Store Connect API, see TESTFLIGHT.md); the upload
+# authenticates with an App Store Connect API key. Runs on pushes to main and on demand.
+# Without the secrets the signed job is skipped with a notice, so the fork CI stays green and
+# the unsigned .ipa from the "Build" workflow remains the fallback.
 name: TestFlight
 
 on:
@@ -30,17 +31,27 @@ jobs:
           KEY_ID: ${{ secrets.ASC_KEY_ID }}
           ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
           PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+          P12: ${{ secrets.ASC_DIST_P12 }}
+          P12_PASSWORD: ${{ secrets.ASC_DIST_P12_PASSWORD }}
+          PROFILE: ${{ secrets.ASC_PROVISIONING_PROFILE }}
         run: |
-          if [ -n "$KEY_ID" ] && [ -n "$ISSUER_ID" ] && [ -n "$PRIVATE_KEY" ]; then
+          missing=""
+          [ -n "$KEY_ID" ] || missing="$missing ASC_KEY_ID"
+          [ -n "$ISSUER_ID" ] || missing="$missing ASC_ISSUER_ID"
+          [ -n "$PRIVATE_KEY" ] || missing="$missing ASC_PRIVATE_KEY"
+          [ -n "$P12" ] || missing="$missing ASC_DIST_P12"
+          [ -n "$P12_PASSWORD" ] || missing="$missing ASC_DIST_P12_PASSWORD"
+          [ -n "$PROFILE" ] || missing="$missing ASC_PROVISIONING_PROFILE"
+          if [ -z "$missing" ]; then
             echo "configured=true" >> "$GITHUB_OUTPUT"
-            echo "App Store Connect secrets present – the signed TestFlight job will run."
+            echo "All signing and App Store Connect secrets present – the signed TestFlight job will run."
           else
             echo "configured=false" >> "$GITHUB_OUTPUT"
-            echo "::notice title=TestFlight upload skipped::Secrets ASC_KEY_ID, ASC_ISSUER_ID and ASC_PRIVATE_KEY are not all set (see TESTFLIGHT.md). The unsigned OpenTara-unsigned.ipa from the Build workflow remains available."
+            echo "::notice title=TestFlight upload skipped::Missing repository secrets:$missing (see TESTFLIGHT.md). The unsigned OpenTara-unsigned.ipa from the Build workflow remains available."
             {
               echo "### TestFlight upload skipped"
               echo
-              echo "Set the repository secrets \`ASC_KEY_ID\`, \`ASC_ISSUER_ID\` and \`ASC_PRIVATE_KEY\` (see TESTFLIGHT.md)."
+              echo "Missing repository secrets: \`$missing\` (see TESTFLIGHT.md)."
               echo "Fallback: the unsigned \`OpenTara-unsigned.ipa\` artifact of the **Build** workflow (SideStore/AltStore)."
             } >> "$GITHUB_STEP_SUMMARY"
           fi
@@ -54,6 +65,8 @@ jobs:
     env:
       ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
       ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      TEAM_ID: 3P3KVS4BZK
+      BUNDLE_ID: com.onkelenno.opentara
     steps:
       - uses: actions/checkout@v4
 
@@ -77,7 +90,47 @@ jobs:
           grep -q "BEGIN PRIVATE KEY" "$KEY" || { echo "::error::ASC_PRIVATE_KEY is neither the .p8 text nor its base64"; exit 1; }
           echo "path=$KEY" >> "$GITHUB_OUTPUT"
 
-      - name: Archive with cloud-managed signing
+      - name: Install distribution certificate and provisioning profile
+        id: signing
+        env:
+          ASC_DIST_P12: ${{ secrets.ASC_DIST_P12 }}
+          ASC_DIST_P12_PASSWORD: ${{ secrets.ASC_DIST_P12_PASSWORD }}
+          ASC_PROVISIONING_PROFILE: ${{ secrets.ASC_PROVISIONING_PROFILE }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/opentara.keychain-db"
+          KEYCHAIN_PASSWORD=$(openssl rand -hex 16)
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+          # Apple WWDR intermediate (G3) – issuer of certificates created today; needed for a full chain.
+          curl -sSfL -o "$RUNNER_TEMP/AppleWWDRCAG3.cer" https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer
+          security import "$RUNNER_TEMP/AppleWWDRCAG3.cer" -k "$KEYCHAIN" -T /usr/bin/codesign -T /usr/bin/security || true
+
+          printf '%s' "$ASC_DIST_P12" | base64 --decode > "$RUNNER_TEMP/dist.p12"
+          security import "$RUNNER_TEMP/dist.p12" -P "$ASC_DIST_P12_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          echo "Signing identities:"
+          security find-identity -v -p codesigning "$KEYCHAIN"
+
+          printf '%s' "$ASC_PROVISIONING_PROFILE" | base64 --decode > "$RUNNER_TEMP/opentara.mobileprovision"
+          security cms -D -i "$RUNNER_TEMP/opentara.mobileprovision" > "$RUNNER_TEMP/profile.plist"
+          UUID=$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$RUNNER_TEMP/profile.plist")
+          NAME=$(/usr/libexec/PlistBuddy -c 'Print :Name' "$RUNNER_TEMP/profile.plist")
+          EXPIRES=$(/usr/libexec/PlistBuddy -c 'Print :ExpirationDate' "$RUNNER_TEMP/profile.plist")
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          cp "$RUNNER_TEMP/opentara.mobileprovision" "$HOME/Library/MobileDevice/Provisioning Profiles/$UUID.mobileprovision"
+          echo "Profile '$NAME' ($UUID), expires $EXPIRES"
+          {
+            echo "keychain=$KEYCHAIN"
+            echo "profile_name=$NAME"
+            echo "profile_uuid=$UUID"
+          } >> "$GITHUB_OUTPUT"
+          rm -f "$RUNNER_TEMP/dist.p12"
+
+      - name: Archive (manual signing, iPhone Distribution)
         run: |
           set -o pipefail
           xcodebuild archive \
@@ -87,21 +140,37 @@ jobs:
             -destination "generic/platform=iOS" \
             -archivePath build/OpenTara.xcarchive \
             -xcconfig .github/testflight/OnkelEnno.xcconfig \
-            -allowProvisioningUpdates \
-            -authenticationKeyPath "${{ steps.key.outputs.path }}" \
-            -authenticationKeyID "$ASC_KEY_ID" \
-            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            PROVISIONING_PROFILE_SPECIFIER="${{ steps.signing.outputs.profile_name }}" \
+            OTHER_CODE_SIGN_FLAGS="--keychain ${{ steps.signing.outputs.keychain }}" \
             CURRENT_PROJECT_VERSION=${{ github.run_number }} \
             2>&1 | tee xcodebuild-archive.log
 
       - name: Upload to App Store Connect (TestFlight)
         run: |
           set -o pipefail
+          cat > build/ExportOptions.plist <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>upload</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>signingCertificate</key><string>iPhone Distribution</string>
+            <key>teamID</key><string>${TEAM_ID}</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>${BUNDLE_ID}</key><string>${{ steps.signing.outputs.profile_name }}</string>
+            </dict>
+            <key>uploadSymbols</key><true/>
+            <key>manageAppVersionAndBuildNumber</key><false/>
+          </dict>
+          </plist>
+          PLIST
           xcodebuild -exportArchive \
             -archivePath build/OpenTara.xcarchive \
-            -exportOptionsPlist .github/testflight/ExportOptions.plist \
+            -exportOptionsPlist build/ExportOptions.plist \
             -exportPath build/export \
-            -allowProvisioningUpdates \
             -authenticationKeyPath "${{ steps.key.outputs.path }}" \
             -authenticationKeyID "$ASC_KEY_ID" \
             -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
@@ -113,7 +182,7 @@ jobs:
           {
             echo "### Uploaded to TestFlight"
             echo
-            echo "- Bundle id: \`com.onkelenno.opentara\`, team \`3P3KVS4BZK\`"
+            echo "- Bundle id: \`${BUNDLE_ID}\`, team \`${TEAM_ID}\`, profile \`${{ steps.signing.outputs.profile_name }}\`"
             echo "- Version ${VERSION}, build ${{ github.run_number }}"
             echo "- App Store Connect processes the build for a few minutes, then it appears under *TestFlight → iOS builds* and reaches the internal testers."
           } >> "$GITHUB_STEP_SUMMARY"
@@ -128,6 +197,9 @@ jobs:
             xcodebuild-export.log
           if-no-files-found: ignore
 
-      - name: Remove API key
+      - name: Remove key material
         if: always()
-        run: rm -f "$HOME/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+        run: |
+          rm -f "$HOME/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+          [ -n "${{ steps.signing.outputs.keychain }}" ] && security delete-keychain "${{ steps.signing.outputs.keychain }}" || true
+          [ -n "${{ steps.signing.outputs.profile_uuid }}" ] && rm -f "$HOME/Library/MobileDevice/Provisioning Profiles/${{ steps.signing.outputs.profile_uuid }}.mobileprovision" || true

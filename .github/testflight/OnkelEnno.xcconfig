@@ -1,17 +1,20 @@
 // Fork-only build settings for signed TestFlight builds of the Onkel Enno team.
 // Passed to xcodebuild with -xcconfig by .github/workflows/testflight.yml; nothing here
 // touches the project file, so the upstream pull request keeps etlami's bundle id.
+// Note: settings in a -xcconfig file override command-line KEY=VALUE pairs, so anything the
+// workflow has to pass per run (build number, profile name, keychain) must NOT appear here.
 
 PRODUCT_BUNDLE_IDENTIFIER = com.onkelenno.opentara
 DEVELOPMENT_TEAM = 3P3KVS4BZK
-CODE_SIGN_STYLE = Automatic
 
-// Archive straight with the distribution identity. With the default (Apple Development)
-// xcodebuild archive asks the portal for a development profile, and that needs at least one
-// registered device ("Your team has no devices from which to generate a provisioning profile").
-// A distribution profile needs none; -allowProvisioningUpdates creates it with the
-// cloud-managed Apple Distribution certificate.
-CODE_SIGN_IDENTITY = Apple Distribution
+// Manual signing with the team's own distribution certificate and an App Store profile, both
+// created through the App Store Connect API (.github/testflight/asc.py) and stored as secrets.
+// Automatic signing cannot archive on a CI runner: it insists on a development profile, and
+// the team has no registered devices to put into one.
+CODE_SIGN_STYLE = Manual
+// The API-issued certificate (type IOS_DISTRIBUTION) is named "iPhone Distribution: …";
+// Xcode matches the identity by that prefix, "Apple Distribution" would not find it.
+CODE_SIGN_IDENTITY = iPhone Distribution
 
 // The project's entitlements file only holds macOS App-Sandbox keys (the project is
 // multiplatform); an iOS App Store build needs none of them. OpenTara uses no HealthKit,
