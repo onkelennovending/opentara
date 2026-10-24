@@ -266,7 +266,11 @@ enum BeurerSanitasProtocol {
         var fatPercent: Double
         var waterPercent: Double
         var musclePercent: Double
+        /// Knochenmasse in 50-g-Schritten wie in openScale gelesen. Auf einem BF700 kam am
+        /// 24.10.2026 der Rohwert 288 (= 14,40 kg so gelesen, 2,88 kg bei 10 g) – die Einheit ist
+        /// noch nicht gegen das Display der Waage bestätigt, deshalb steht `boneRaw` daneben.
         var boneKg: Double
+        var boneRaw: Int
         var bmrKcal: Int
         var amrKcal: Int
         var bmi: Double
@@ -288,6 +292,7 @@ enum BeurerSanitasProtocol {
                            waterPercent: Double(u16(b, at: 10)) / 10.0,
                            musclePercent: Double(u16(b, at: 12)) / 10.0,
                            boneKg: kilograms(b, at: 14),
+                           boneRaw: Int(u16(b, at: 14)),
                            bmrKcal: Int(u16(b, at: 16)),
                            amrKcal: Int(u16(b, at: 18)),
                            bmi: Double(u16(b, at: 20)) / 10.0)
@@ -521,13 +526,19 @@ final class BeurerSanitasDriver: ScaleDriver {
 
         // Wiedererkennen über Name-Präfix (die Waage speichert 3 Zeichen, die Hersteller-App
         // teils in Kleinbuchstaben) und Geburtsjahr – wie openScale.
-        if let known = remoteUsers.first(where: {
-            !$0.name.isEmpty
-                && localName.lowercased().hasPrefix($0.name.lowercased())
-                && $0.birthYear == birthYear
-        }) {
+        let sameName = remoteUsers.filter { !$0.name.isEmpty && localName.lowercased().hasPrefix($0.name.lowercased()) }
+        if let known = sameName.first(where: { $0.birthYear == birthYear }) {
             currentUser = known
             log("Nutzer wiedererkannt: \(known.name) (\(known.birthYear), uid \(known.uid))")
+            proceed(to: .userDetails)
+            return
+        }
+        // Gleicher Name, anderes Geburtsjahr (z. B. in der Hersteller-App anders eingetragen):
+        // die Waage lehnt einen zweiten Nutzer mit diesem Namen ab (Code 3), also den vorhandenen
+        // nehmen. Die Körperwerte rechnet OpenTara ohnehin selbst aus Gewicht und Impedanz.
+        if sameName.count == 1, let known = sameName.first {
+            currentUser = known
+            log("Nutzer \(known.name) auf der Waage hat Geburtsjahr \(known.birthYear), Profil \(birthYear) – nutze ihn trotzdem (uid \(known.uid))")
             proceed(to: .userDetails)
             return
         }
@@ -586,11 +597,25 @@ final class BeurerSanitasDriver: ScaleDriver {
             switch code {
             case 0:
                 log("← Nutzer angelegt")
+                if let u = currentUser { remoteUsers.append(u) }
                 proceed(to: .measure)
             case 1:
                 status(String(localized: "Waage: Nutzerspeicher voll – bitte in der Hersteller-App einen Nutzer löschen"))
                 currentUser = nil
                 step = .finished
+            case 3:
+                // Name schon vergeben: den vorhandenen Nutzer mit diesem Namen verwenden.
+                let name = currentUser?.name.lowercased() ?? ""
+                if let existing = remoteUsers.first(where: { !name.isEmpty && $0.name.lowercased() == name }) {
+                    log("← Name \(existing.name) schon vergeben – nutze vorhandenen Nutzer (uid \(existing.uid), \(existing.birthYear))")
+                    currentUser = existing
+                    proceed(to: .userDetails)
+                } else {
+                    log("← Nutzer anlegen abgelehnt: Name schon vergeben")
+                    status(String(localized: "Waage hat den Nutzer abgelehnt (Name schon vergeben)"))
+                    currentUser = nil
+                    step = .finished
+                }
             default:
                 log("← Nutzer anlegen abgelehnt (Code \(code))")
                 status(String(localized: "Waage hat den Nutzer abgelehnt (Code \(code))"))
@@ -695,9 +720,9 @@ final class BeurerSanitasDriver: ScaleDriver {
             return nil
         }
         partialMeasurement = nil
-        log(String(format: "Waage meldet: %.2f kg, %ld Ω, Fett %.1f %%, Wasser %.1f %%, Muskel %.1f %%, Knochen %.2f kg, BMR %ld, AMR %ld, BMI %.1f",
+        log(String(format: "Waage meldet: %.2f kg, %ld Ω, Fett %.1f %%, Wasser %.1f %%, Muskel %.1f %%, Knochen roh %ld (%.2f kg bei 10 g, %.2f kg bei 50 g), BMR %ld, AMR %ld, BMI %.1f",
                    m.weightKg, m.impedanceOhm, m.fatPercent, m.waterPercent, m.musclePercent,
-                   m.boneKg, m.bmrKcal, m.amrKcal, m.bmi))
+                   m.boneRaw, Double(m.boneRaw) / 100.0, m.boneKg, m.bmrKcal, m.amrKcal, m.bmi))
         status(String(localized: "Messung abgeschlossen"))
 
         // Zeitstempel der Waage nur übernehmen, wenn er plausibel ist (±1 Tag), sonst "jetzt".

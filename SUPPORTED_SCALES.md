@@ -18,8 +18,12 @@ Common scales openScale supports that could be ported once a tester is available
 Yunmai (Mini/SE), Medisana BS444/BS430, Trisa, Excelvan, and other Bluetooth‑SIG
 compliant scales.
 
-The Beurer/Sanitas driver (0xFFE0/0xFFE1 command protocol) was ported blind from openScale
-and still needs its first confirmation on a real BF700/BF710/BF800 or SBF70/SBF75.
+The Beurer/Sanitas driver (0xFFE0/0xFFE1 command protocol) was ported from openScale. First
+live run on a Beurer BF700 (advertises as `BF700`, start byte 0xE7) on 2026-10-24: init, status,
+user list, user creation, measurement trigger, live weight and the 22-byte measurement (weight,
+impedance, BMI consistent with the profile height) all decoded as expected. Still open: the unit of
+the bone-mass field (raw 288 on a 103 kg person) and a second device of the 0xF7 family
+(BF-700 / BF800 / Libra).
 
 If you own any Bluetooth body scale, please help verify it — see
 [CONTRIBUTING.md](CONTRIBUTING.md). Capturing a few raw‑data lines is enough.

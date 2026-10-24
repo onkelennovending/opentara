@@ -208,11 +208,41 @@ struct BeurerSanitasFrameTests {
         #expect(P.parseLiveWeight([0xE7, 0x58, 0x00]) == nil)
     }
 
+    /// Echte Frames eines Beurer BF700 (meldet sich als "BF700") vom 24.10.2026: 103,40 kg, 510 Ω.
+    @Test func parsesRealBF700Frames() {
+        let status = P.parseStatus([0xE7, 0xF0, 0x4F, 0x01, 0x4F, 0x14, 0xDC, 0x01, 0x01, 0x01, 0x01, 0x05])
+        #expect(status?.batteryPercent == 79)
+        #expect(status?.weightThresholdKg == 2.0)
+        #expect(status?.fatThresholdPercent == 22.0)
+        #expect(status?.unitCode == 1)
+        #expect(status?.version == 5)
+
+        let entry = P.parseUserListEntry([0xE7, 0x34, 0x01, 0x01, 0, 0, 0, 0, 0, 0, 0, 0x65, 0x46, 0x41, 0x42, 0x63])
+        #expect(entry == P.UserListEntry(count: 1, current: 1, uid: 101, name: "FAB", birthYear: 1999))
+
+        #expect(P.parseLiveWeight([0xE7, 0x58, 0x01, 0x00, 0xB1]) == P.LiveWeight(isStable: false, weightKg: 8.85))
+        #expect(P.parseLiveWeight([0xE7, 0x58, 0x00, 0x08, 0x14]) == P.LiveWeight(isStable: true, weightKg: 103.4))
+
+        let part2: [UInt8] = [0x6A, 0xDC, 0xFC, 0x2B, 0x08, 0x14, 0x01, 0xFE, 0x01, 0x4C, 0x01]
+        let part3: [UInt8] = [0xB6, 0x01, 0x61, 0x01, 0x20, 0x08, 0x93, 0x0C, 0xDD, 0x01, 0x46]
+        let m = P.parseMeasurement(part2 + part3)
+        #expect(m?.timestamp == 0x6ADC_FC2B)          // = gesetzte Uhrzeit 0x6ADCFC17 + 20 s, kein Bit 31
+        #expect(m?.weightKg == 103.4)
+        #expect(m?.impedanceOhm == 510)
+        #expect(m?.fatPercent == 33.2)
+        #expect(m?.waterPercent == 43.8)
+        #expect(m?.musclePercent == 35.3)
+        #expect(m?.boneRaw == 288)
+        #expect(m?.bmrKcal == 2195)
+        #expect(m?.amrKcal == 3293)
+        #expect(m?.bmi == 32.6)                        // passt zu 103,4 kg / 1,78 m
+    }
+
     @Test func parsesMeasurementAndMasksBit31() {
         let m = P.parseMeasurement(measurementBytes)
         #expect(m == P.Measurement(timestamp: 0x6A92_90C2, weightKg: 83.0, impedanceOhm: 500,
                                    fatPercent: 20.0, waterPercent: 55.0, musclePercent: 42.0, boneKg: 3.0,
-                                   bmrKcal: 1800, amrKcal: 2500, bmi: 25.0))
+                                   boneRaw: 60, bmrKcal: 1800, amrKcal: 2500, bmi: 25.0))
         #expect(m?.date == Date(timeIntervalSince1970: measurementTimestamp))
         #expect(P.parseMeasurement(Array(measurementBytes.dropLast())) == nil)
     }
@@ -295,10 +325,39 @@ struct BeurerSanitasDriverFlowTests {
         #expect(rec.sent[4] == [0xF7, 0x31] + uid101 + [0x46, 0x41, 0x42, 0x55, 0x02, 0x07, 0xB4, 0x83])
         #expect(driver.currentUser == BeurerSanitasDriver.RemoteUser(uid: 101, name: "FAB", birthYear: 1985))
 
-        // Angelegt → direkt Messung starten (ohne Details-Abfrage)
+        // Angelegt → direkt Messung starten (ohne Details-Abfrage); der neue Nutzer ist jetzt bekannt
         _ = feed(driver, link, [0xF7, 0xF0, 0x31, 0x00])
         #expect(rec.sent[5] == [0xF7, 0x40] + uid101)
         #expect(driver.step == .measure)
+        #expect(driver.remoteUsers.map(\.uid) == [101])
+    }
+
+    @Test func reusesScaleUserWithSameNameButOtherBirthYear() {
+        // Waage kennt FAB mit Geburtsjahr 1999 (so im Beurer-Log vom 24.10.2026), Profil sagt 1985.
+        let (driver, rec, link) = readyDriver(name: "BF700", user: fabian())
+        _ = feed(driver, link, [0xE6, 0x00, 0x20])
+        _ = feed(driver, link, [0xE7, 0xF0, 0x4F, 0x01, 0x4F, 0x14, 0xDC, 0x01, 0x01, 0x01, 0x01, 0x05])
+        _ = feed(driver, link, [0xE7, 0xF0, 0x33, 0x00, 0x01, 0x08])
+        _ = feed(driver, link, [0xE7, 0x34, 0x01, 0x01] + uid101 + [0x46, 0x41, 0x42, 0x63])
+        #expect(driver.currentUser == BeurerSanitasDriver.RemoteUser(uid: 101, name: "FAB", birthYear: 1999))
+        #expect(rec.sent.last == [0xE7, 0x36] + uid101)          // Details, kein Anlegen
+        #expect(!rec.sent.contains { $0.count > 1 && $0[1] == P.Cmd.userAdd })
+        #expect(rec.logs.contains { $0.contains("Geburtsjahr 1999") })
+    }
+
+    @Test func nameAlreadyUsedFallsBackToExistingUser() {
+        // Zwei FAB-Nutzer auf der Waage (uneindeutig) → Anlegen wird versucht, Waage sagt Code 3.
+        let (driver, rec, link) = readyDriver(name: "BF700", user: fabian())
+        _ = feed(driver, link, [0xE6, 0x00, 0x20])
+        _ = feed(driver, link, [0xE7, 0xF0, 0x4F, 0x00, 0x5A, 0x28, 0xDC, 0x01, 0x00, 0x00, 0x00, 0x03])
+        _ = feed(driver, link, [0xE7, 0xF0, 0x33, 0x00, 0x02, 0x08])
+        _ = feed(driver, link, [0xE7, 0x34, 0x02, 0x01] + uid101 + [0x46, 0x41, 0x42, 0x63])
+        _ = feed(driver, link, [0xE7, 0x34, 0x02, 0x02, 0, 0, 0, 0, 0, 0, 0, 0x66, 0x46, 0x41, 0x42, 0x65])
+        #expect(rec.sent.last?[1] == P.Cmd.userAdd)
+        _ = feed(driver, link, [0xE7, 0xF0, 0x31, 0x03])
+        #expect(driver.currentUser?.uid == 101)
+        #expect(rec.sent.last == [0xE7, 0x36] + uid101)
+        #expect(driver.step == .userDetails)
     }
 
     @Test func newUidIsMaxPlusOne() {
